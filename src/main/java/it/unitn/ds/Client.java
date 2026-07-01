@@ -3,9 +3,13 @@ package it.unitn.ds;
 import akka.actor.ActorRef;
 import akka.actor.Props;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 
 public class Client extends AbstractClient {
+
+    private final Map<ActorRef, ActorRef> channels = new HashMap<>();
 
     Client(long readTimeoutDelay, long writeTimeoutDelay, Optional<ActorRef> defaultTargetReplica, Optional<ActorRef> listener) {
         super(readTimeoutDelay, writeTimeoutDelay, listener, defaultTargetReplica);
@@ -22,7 +26,10 @@ public class Client extends AbstractClient {
 
     @Override
     public void sendRead(ActorRef replica, int index) {
-        // TODO: implement        
+        ActorRef channel = channels.computeIfAbsent(replica, r ->
+            getContext().actorOf(NetworkChannel.props(r, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY),
+                "channel_to_" + r.path().name()));
+        channel.tell(new Replica.ReadFromClient(index), getSelf());
     }
 
     @Override
@@ -30,10 +37,15 @@ public class Client extends AbstractClient {
         // TODO: implement
     }
 
+    private void onReadResult(AbstractClient.ReadResult result) {
+        callbackOnReadResult(result);
+    }
+
     @Override
     public final Receive createReceive() {
         return createBaseReceiveBuilder()
                 // TODO add your message handlers here .match(, )
+                .match(AbstractClient.ReadResult.class, this::onReadResult)
                 .build();
     }
 
