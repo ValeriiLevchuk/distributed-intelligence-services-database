@@ -20,10 +20,14 @@ public class Replica extends AbstractReplica {
     private final Map<UpdateId, Update> pendingUpdates = new HashMap<>();
     private final Map<UpdateId, Integer> ackCount = new HashMap<>();
     private final Map<UpdateId, ActorRef> pendingClients = new HashMap<>();
+    private final Map<UpdateId, Update> updateHistory = new HashMap<>();
+    private UpdateId lastAppliedId = null;
     private int epoch = 0;
     private int seqnum = 0;
     private AbstractReplica.Crash pendingCrash = null;
     private int crashMessagesRemaining = 0;
+    private Cancellable heartbeatSender = null;
+    private Cancellable heartbeatTimeout = null;
 
     public Replica(int id) {
         this(id, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY, AbstractReplica.COORDINATOR_BEAT_INTERVAL, Optional.empty());
@@ -65,6 +69,11 @@ public class Replica extends AbstractReplica {
         // TODO: implement
         this.replicas = new HashMap<>(sysInit.group);
         this.coordinatorID = sysInit.coordinator_id;
+        if (this.id == coordinatorID) {
+            heartbeatSender = scheduleTimeout(getCoordinatorBeatInterval(), new SendHeartbeat());
+        } else {
+            heartbeatTimeout = scheduleTimeout(getCoordinatorBeatInterval() * 2, new HeartbeatTimeout());
+        }
     }
 
     // =================================================================================
@@ -96,7 +105,7 @@ public class Replica extends AbstractReplica {
         }
     }
 
-    public static class UpdateId implements Serializable {
+    public static class UpdateId implements Serializable, Comparable<UpdateId> {
         public final int epoch;
         public final int seqnum;
 
@@ -113,6 +122,11 @@ public class Replica extends AbstractReplica {
 
         @Override public int hashCode() {
             return 31 * epoch + seqnum;
+        }
+
+        @Override public int compareTo(UpdateId other) {
+            if (this.epoch != other.epoch) return Integer.compare(this.epoch, other.epoch);
+            return Integer.compare(this.seqnum, other.seqnum);
         }
     }
 
@@ -137,6 +151,12 @@ public class Replica extends AbstractReplica {
         public final UpdateId id;
         public WriteOk(UpdateId id) { this.id = id; }
     }
+
+    public static class Heartbeat implements Serializable {}
+
+    private static class SendHeartbeat implements Serializable {}
+
+    private static class HeartbeatTimeout implements Serializable {}
 
     // =================================================================================
     // Helpers
@@ -181,6 +201,29 @@ public class Replica extends AbstractReplica {
         tell(new AbstractClient.ReadResult(true, msg.index, positions[msg.index], this.id), getSender());
     }
 
+    private void onSendHeartbeat(SendHeartbeat msg) {
+        for (ActorRef r : replicas.values()) {
+            tell(new Heartbeat(), r);
+        }
+        heartbeatSender = scheduleTimeout(getCoordinatorBeatInterval(), new SendHeartbeat());
+        checkCrash(AbstractReplica.Crash.Type.Heartbeat);
+    }
+
+    private void onHeartbeat(Heartbeat msg) {
+        if (heartbeatTimeout != null) heartbeatTimeout.cancel();
+        heartbeatTimeout = scheduleTimeout(getCoordinatorBeatInterval() * 2, new HeartbeatTimeout());
+    }
+
+    private void onHeartbeatTimeout(HeartbeatTimeout msg) {
+        startElection();
+    }
+
+    private void startElection() {
+        callbackOnElectionStarted(coordinatorID);
+        getContext().become(createElectionBehavior());
+        // send election message
+    }
+
     private void onAck(Replica.Ack msg) {
         if (!ackCount.containsKey(msg.id))
             return;
@@ -205,6 +248,9 @@ public class Replica extends AbstractReplica {
         Update update = pendingUpdates.remove(msg.id);
         if (update == null) return;
         positions[update.index] = update.value;
+        updateHistory.put(msg.id, update);
+        if (lastAppliedId == null || msg.id.compareTo(lastAppliedId) > 0) lastAppliedId = msg.id;
+        callbackOnUpdateApplied(update.index, update.value);
         ActorRef client = pendingClients.remove(msg.id);
         if (client != null) {
             tell(new AbstractClient.WriteResult(true, update.index, update.value, this.id), client);
@@ -237,6 +283,9 @@ public class Replica extends AbstractReplica {
                 .match(Replica.Update.class, this::onUpdate)
                 .match(Replica.WriteOk.class, this::onWriteOk)
                 .match(Replica.WriteFromClient.class, this::onWriteFromClient)
+                .match(SendHeartbeat.class, this::onSendHeartbeat)
+                .match(Heartbeat.class, this::onHeartbeat)
+                .match(HeartbeatTimeout.class, this::onHeartbeatTimeout)
                 .build();
     }
 
