@@ -1,12 +1,16 @@
 package it.unitn.ds;
 
 import akka.actor.ActorRef;
+import akka.actor.Cancellable;
 import akka.actor.Props;
 
 import java.io.Serializable;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+
+import scala.concurrent.duration.Duration;
 
 public class Replica extends AbstractReplica {
     private Map<Integer, ActorRef> replicas = new HashMap<>();
@@ -18,6 +22,8 @@ public class Replica extends AbstractReplica {
     private final Map<UpdateId, ActorRef> pendingClients = new HashMap<>();
     private int epoch = 0;
     private int seqnum = 0;
+    private AbstractReplica.Crash pendingCrash = null;
+    private int crashMessagesRemaining = 0;
 
     public Replica(int id) {
         this(id, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY, AbstractReplica.COORDINATOR_BEAT_INTERVAL, Optional.empty());
@@ -46,6 +52,12 @@ public class Replica extends AbstractReplica {
     @Override
     public void crash(AbstractReplica.Crash how_to_crash) {
         // TODO: implement
+        if (how_to_crash.type == AbstractReplica.Crash.Type.Now) {
+            getContext().become(createCrashedBehavior());
+        } else {
+            pendingCrash = how_to_crash;
+            crashMessagesRemaining = how_to_crash.after_n_messages_of_type;
+        }
     }
 
     @Override
@@ -127,6 +139,41 @@ public class Replica extends AbstractReplica {
     }
 
     // =================================================================================
+    // Helpers
+    // =================================================================================
+
+    private Cancellable scheduleTimeout(long delayMs, Serializable msg) {
+        return getContext().system().scheduler().scheduleOnce(
+            Duration.create(delayMs, TimeUnit.MILLISECONDS),
+            getSelf(),
+            msg,
+            getContext().system().dispatcher(),
+            ActorRef.noSender()
+        );
+    }
+
+    private void checkCrash(AbstractReplica.Crash.Type type) {
+        if (pendingCrash == null || pendingCrash.type != type) return;
+        if (--crashMessagesRemaining <= 0) {
+            getContext().become(createCrashedBehavior());
+            pendingCrash = null;
+        }
+    }
+
+    private Receive createCrashedBehavior() {
+        return receiveBuilder()
+            .matchAny(msg -> {})
+            .build();
+    }
+
+    private Receive createElectionBehavior() {
+        return receiveBuilder()
+            // handline the elections
+            .matchAny(msg -> {})
+            .build();
+    }
+
+    // =================================================================================
     // Wrapper Handlers
     // =================================================================================
 
@@ -148,6 +195,7 @@ public class Replica extends AbstractReplica {
     }
 
     private void onUpdate(Replica.Update msg) {
+        if (pendingUpdates.containsKey(msg.id)) return;
         pendingUpdates.put(msg.id, msg);
         if (msg.sourceReplicaId == this.id) pendingClients.put(msg.id, msg.clientRef);
         tell(new Ack(msg.id), getSender());
