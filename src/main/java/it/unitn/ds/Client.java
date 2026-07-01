@@ -35,10 +35,18 @@ public class Client extends AbstractClient {
     @Override
     public void sendWrite(ActorRef replica, int index, int value) {
         // TODO: implement
+        ActorRef channel = channels.computeIfAbsent(replica, r ->
+            getContext().actorOf(NetworkChannel.props(r, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY),
+                "channel_to_" + r.path().name()));
+        channel.tell(new Replica.WriteFromClient(index, value, getSelf(), -1), getSelf());
     }
 
     private void onReadResult(AbstractClient.ReadResult result) {
         callbackOnReadResult(result);
+    }
+
+    private void onWriteResult(AbstractClient.WriteResult result) {
+        callbackOnWriteResult(result);
     }
 
     @Override
@@ -46,6 +54,7 @@ public class Client extends AbstractClient {
         return createBaseReceiveBuilder()
                 // TODO add your message handlers here .match(, )
                 .match(AbstractClient.ReadResult.class, this::onReadResult)
+                .match(AbstractClient.WriteResult.class, this::onWriteResult)
                 .build();
     }
 

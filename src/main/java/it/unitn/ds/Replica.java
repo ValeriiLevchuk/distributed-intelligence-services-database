@@ -3,6 +3,7 @@ package it.unitn.ds;
 import akka.actor.ActorRef;
 import akka.actor.Props;
 
+import java.io.Serializable;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -11,6 +12,12 @@ public class Replica extends AbstractReplica {
     private Map<Integer, ActorRef> replicas = new HashMap<>();
     private int coordinatorID;
     private int[] positions = new int[AbstractReplica.POSITIONS_LIST_LENGTH];
+
+    private final Map<UpdateId, Update> pendingUpdates = new HashMap<>();
+    private final Map<UpdateId, Integer> ackCount = new HashMap<>();
+    private final Map<UpdateId, ActorRef> pendingClients = new HashMap<>();
+    private int epoch = 0;
+    private int seqnum = 0;
 
     public Replica(int id) {
         this(id, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY, AbstractReplica.COORDINATOR_BEAT_INTERVAL, Optional.empty());
@@ -66,6 +73,59 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    public static class WriteFromClient implements Serializable {
+        public final int index;
+        public final int value;
+        public final ActorRef clientRef;
+        public final int sourceReplicaId;
+        public WriteFromClient(int index, int value, ActorRef clientRef, int sourceReplicaId) {
+            this.index = index; this.value = value;
+            this.clientRef = clientRef; this.sourceReplicaId = sourceReplicaId;
+        }
+    }
+
+    public static class UpdateId implements Serializable {
+        public final int epoch;
+        public final int seqnum;
+
+        public UpdateId(int epoch, int seqnum) {
+            this.epoch = epoch;
+            this.seqnum = seqnum;
+        }
+
+        @Override public boolean equals(Object o) {
+            if (!(o instanceof UpdateId)) return false;
+            UpdateId other = (UpdateId) o;
+            return epoch == other.epoch && seqnum == other.seqnum;
+        }
+
+        @Override public int hashCode() {
+            return 31 * epoch + seqnum;
+        }
+    }
+
+    public static class Update implements Serializable {
+        public final UpdateId id;
+        public final int index;
+        public final int value;
+        public final ActorRef clientRef;
+        public final int sourceReplicaId;
+        public Update(UpdateId id, int index, int value, ActorRef clientRef, int sourceReplicaId) {
+            this.id = id; this.index = index; this.value = value;
+            this.clientRef = clientRef; this.sourceReplicaId = sourceReplicaId;
+        }
+    }
+
+    public static class Ack implements Serializable {
+        public final UpdateId id;
+        public Ack(UpdateId id) { this.id = id; }
+    }
+
+    public static class WriteOk implements Serializable {
+        public final UpdateId id;
+        public WriteOk(UpdateId id) { this.id = id; }
+    }
+
     // =================================================================================
     // Wrapper Handlers
     // =================================================================================
@@ -74,11 +134,61 @@ public class Replica extends AbstractReplica {
         tell(new AbstractClient.ReadResult(true, msg.index, positions[msg.index], this.id), getSender());
     }
 
+    private void onAck(Replica.Ack msg) {
+        if (!ackCount.containsKey(msg.id))
+            return;
+        int count = ackCount.get(msg.id) + 1;
+        ackCount.put(msg.id, count);
+        if (count >= replicas.size() / 2 + 1) {
+            ackCount.remove(msg.id);
+            for (ActorRef r : replicas.values()) {
+                tell(new WriteOk(msg.id), r);
+            }
+        }
+    }
+
+    private void onUpdate(Replica.Update msg) {
+        pendingUpdates.put(msg.id, msg);
+        if (msg.sourceReplicaId == this.id) pendingClients.put(msg.id, msg.clientRef);
+        tell(new Ack(msg.id), getSender());
+    }
+
+    private void onWriteOk(Replica.WriteOk msg) {
+        Update update = pendingUpdates.remove(msg.id);
+        if (update == null) return;
+        positions[update.index] = update.value;
+        ActorRef client = pendingClients.remove(msg.id);
+        if (client != null) {
+            tell(new AbstractClient.WriteResult(true, update.index, update.value, this.id), client);
+        }
+    }
+
+    private void onWriteFromClient(Replica.WriteFromClient msg) {
+        WriteFromClient stamped = msg.sourceReplicaId == -1
+            ? new WriteFromClient(msg.index, msg.value, msg.clientRef, this.id)
+            : msg;
+        if (this.id == coordinatorID) {
+            UpdateId uid = new UpdateId(epoch, seqnum++);
+            Update update = new Update(uid, stamped.index, stamped.value, stamped.clientRef, stamped.sourceReplicaId);
+            pendingUpdates.put(uid, update);
+            ackCount.put(uid, 0);
+            for (ActorRef r : replicas.values()) {
+                tell(update, r);
+            }
+        } else {
+            tell(stamped, replicas.get(coordinatorID));
+        }
+    }
+
     @Override
     public final Receive createReceive() {
         return createBaseReceiveBuilder()
                 // TODO add your message handlers here .match(, )
                 .match(Replica.ReadFromClient.class, this::onReadFromClient)
+                .match(Replica.Ack.class, this::onAck)
+                .match(Replica.Update.class, this::onUpdate)
+                .match(Replica.WriteOk.class, this::onWriteOk)
+                .match(Replica.WriteFromClient.class, this::onWriteFromClient)
                 .build();
     }
 

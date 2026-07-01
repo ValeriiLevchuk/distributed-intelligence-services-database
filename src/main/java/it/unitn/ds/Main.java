@@ -52,6 +52,8 @@ public class Main {
         
         // TODO: Implement your main logic
         clients.get(1).tell(new AbstractClient.ReadRequest(0), ActorRef.noSender());
+        clients.get(1).tell(new AbstractClient.WriteRequest(0, 67), ActorRef.noSender());
+        clients.get(1).tell(new AbstractClient.ReadRequest(0), ActorRef.noSender());
         try {
             Thread.sleep(3000);
         } catch (InterruptedException e) {
