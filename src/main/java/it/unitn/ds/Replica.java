@@ -5,7 +5,10 @@ import akka.actor.Cancellable;
 import akka.actor.Props;
 
 import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -30,6 +33,7 @@ public class Replica extends AbstractReplica {
     private Cancellable heartbeatTimeout = null;
     private final Map<UpdateId, Cancellable> writeOkTimers = new HashMap<>();
     private Cancellable updateTimeout = null;
+    private Cancellable electionAckTimer = null;
 
     public Replica(int id) {
         this(id, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY, AbstractReplica.COORDINATOR_BEAT_INTERVAL, Optional.empty());
@@ -167,6 +171,32 @@ public class Replica extends AbstractReplica {
 
     private static class UpdateTimeout implements Serializable {}
 
+    private static class ElectionAckTimeout implements Serializable {
+        final Election election;
+        final int targetId;
+        ElectionAckTimeout(Election election, int targetId) {
+            this.election = election; this.targetId = targetId;
+        }
+    }
+
+    public static class Election implements Serializable {
+        public final Map<Integer, UpdateId> candidates;
+        public Election(Map<Integer, UpdateId> candidates) {
+            this.candidates = Collections.unmodifiableMap(new HashMap<>(candidates));
+        }
+    }
+
+    public static class ElectionAck implements Serializable {}
+
+    public static class Synchronization implements Serializable {
+        public final int newCoordinatorId;
+        public final Map<UpdateId, Update> history;
+        public Synchronization(int newCoordinatorId, Map<UpdateId, Update> history) {
+            this.newCoordinatorId = newCoordinatorId;
+            this.history = Collections.unmodifiableMap(new HashMap<>(history));
+        }
+    }
+
     // =================================================================================
     // Helpers
     // =================================================================================
@@ -189,6 +219,39 @@ public class Replica extends AbstractReplica {
         }
     }
 
+    private int nextInRingAfter(int id) {
+        List<Integer> sorted = new ArrayList<>(replicas.keySet());
+        Collections.sort(sorted);
+        int idx = sorted.indexOf(id);
+        return sorted.get((idx + 1) % sorted.size());
+    }
+
+    private void sendElectionWithAckTimer(Election msg, int targetId) {
+        tell(msg, replicas.get(targetId));
+        if (electionAckTimer != null) electionAckTimer.cancel();
+        electionAckTimer = scheduleTimeout(getMaxLatencyPlusTolerance(), new ElectionAckTimeout(msg, targetId));
+    }
+
+    private int bestCandidate(Map<Integer, UpdateId> candidates) {
+        int best = -1;
+        UpdateId bestUid = null;
+        for (Map.Entry<Integer, UpdateId> entry : candidates.entrySet()) {
+            int rid = entry.getKey();
+            UpdateId uid = entry.getValue();
+            if (best == -1) {
+                best = rid; bestUid = uid;
+            } else {
+                boolean challengerWins;
+                if (uid == null && bestUid == null) challengerWins = rid > best;
+                else if (uid == null)  challengerWins = false;
+                else if (bestUid == null) challengerWins = true;
+                else { int cmp = uid.compareTo(bestUid); challengerWins = cmp > 0 || (cmp == 0 && rid > best); }
+                if (challengerWins) { best = rid; bestUid = uid; }
+            }
+        }
+        return best;
+    }
+
     private Receive createCrashedBehavior() {
         return receiveBuilder()
             .matchAny(msg -> {})
@@ -197,9 +260,89 @@ public class Replica extends AbstractReplica {
 
     private Receive createElectionBehavior() {
         return receiveBuilder()
-            // handline the elections
+            .match(Election.class, this::onElection)
+            .match(ElectionAck.class, msg -> {
+                if (electionAckTimer != null) { electionAckTimer.cancel(); electionAckTimer = null; }
+            })
+            .match(ElectionAckTimeout.class, this::onElectionAckTimeout)
+            .match(Synchronization.class, this::onSynchronization)
             .matchAny(msg -> {})
             .build();
+    }
+
+    private void onElection(Election msg) {
+        if (!msg.candidates.containsKey(this.id)) {
+            // not yet in this election: add self, forward, ACK sender
+            Map<Integer, UpdateId> updated = new HashMap<>(msg.candidates);
+            updated.put(this.id, lastAppliedId);
+            sendElectionWithAckTimer(new Election(updated), nextInRingAfter(this.id));
+            tell(new ElectionAck(), getSender());
+            checkCrash(AbstractReplica.Crash.Type.Election);
+        } else {
+            // message came back around: determine winner
+            int winner = bestCandidate(msg.candidates);
+            if (winner == this.id) {
+                callbackOnCoordinatorElected(this.id);
+                for (ActorRef r : replicas.values()) {
+                    tell(new Synchronization(this.id, updateHistory), r);
+                }
+            } else {
+                sendElectionWithAckTimer(msg, nextInRingAfter(this.id));
+            }
+        }
+    }
+
+    private void onElectionAckTimeout(ElectionAckTimeout msg) {
+        int next = nextInRingAfter(msg.targetId);
+        if (next == this.id) {
+            // went all the way around with no response: sole survivor
+            callbackOnCoordinatorElected(this.id);
+            for (ActorRef r : replicas.values()) {
+                tell(new Synchronization(this.id, updateHistory), r);
+            }
+        } else {
+            sendElectionWithAckTimer(msg.election, next);
+        }
+    }
+
+    private void onSynchronization(Synchronization msg) {
+        if (electionAckTimer != null) { electionAckTimer.cancel(); electionAckTimer = null; }
+        // Apply committed updates from winner's history that we're missing
+        for (Map.Entry<UpdateId, Update> entry : msg.history.entrySet()) {
+            if (!updateHistory.containsKey(entry.getKey())) {
+                Update update = entry.getValue();
+                pendingUpdates.remove(entry.getKey());
+                Cancellable t = writeOkTimers.remove(entry.getKey());
+                if (t != null) t.cancel();
+                positions[update.index] = update.value;
+                updateHistory.put(entry.getKey(), update);
+                if (lastAppliedId == null || entry.getKey().compareTo(lastAppliedId) > 0)
+                    lastAppliedId = entry.getKey();
+                callbackOnUpdateApplied(update.index, update.value);
+            }
+        }
+
+        coordinatorID = msg.newCoordinatorId;
+        epoch = (lastAppliedId != null ? lastAppliedId.epoch : epoch) + 1;
+        callbackOnCoordinatorElected(msg.newCoordinatorId);
+        getContext().unbecome();
+
+        if (this.id == msg.newCoordinatorId) {
+            // complete any uncommitted pending updates before starting new epoch
+            seqnum = 0;
+            for (UpdateId uid : new ArrayList<>(pendingUpdates.keySet())) {
+                ackCount.remove(uid);
+                for (ActorRef r : replicas.values()) {
+                    tell(new WriteOk(uid), r);
+                }
+            }
+            if (heartbeatTimeout != null) { heartbeatTimeout.cancel(); heartbeatTimeout = null; }
+            if (heartbeatSender != null) heartbeatSender.cancel();
+            heartbeatSender = scheduleTimeout(getCoordinatorBeatInterval(), new SendHeartbeat());
+        } else {
+            if (heartbeatTimeout != null) heartbeatTimeout.cancel();
+            heartbeatTimeout = scheduleTimeout(getCoordinatorBeatInterval() * 2, new HeartbeatTimeout());
+        }
     }
 
     // =================================================================================
@@ -229,8 +372,10 @@ public class Replica extends AbstractReplica {
 
     private void startElection() {
         callbackOnElectionStarted(coordinatorID);
-        getContext().become(createElectionBehavior());
-        // send election message
+        getContext().become(createElectionBehavior()); // switch first: freeze lastAppliedId
+        Map<Integer, UpdateId> candidates = new HashMap<>();
+        candidates.put(this.id, lastAppliedId);
+        sendElectionWithAckTimer(new Election(candidates), nextInRingAfter(this.id));
     }
 
     private void onWriteOkTimeout(WriteOkTimeout msg) {
