@@ -28,6 +28,8 @@ public class Replica extends AbstractReplica {
     private int crashMessagesRemaining = 0;
     private Cancellable heartbeatSender = null;
     private Cancellable heartbeatTimeout = null;
+    private final Map<UpdateId, Cancellable> writeOkTimers = new HashMap<>();
+    private Cancellable updateTimeout = null;
 
     public Replica(int id) {
         this(id, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY, AbstractReplica.COORDINATOR_BEAT_INTERVAL, Optional.empty());
@@ -158,6 +160,13 @@ public class Replica extends AbstractReplica {
 
     private static class HeartbeatTimeout implements Serializable {}
 
+    private static class WriteOkTimeout implements Serializable {
+        final UpdateId id;
+        WriteOkTimeout(UpdateId id) { this.id = id; }
+    }
+
+    private static class UpdateTimeout implements Serializable {}
+
     // =================================================================================
     // Helpers
     // =================================================================================
@@ -224,6 +233,14 @@ public class Replica extends AbstractReplica {
         // send election message
     }
 
+    private void onWriteOkTimeout(WriteOkTimeout msg) {
+        if (pendingUpdates.containsKey(msg.id)) startElection();
+    }
+
+    private void onUpdateTimeout(UpdateTimeout msg) {
+        startElection();
+    }
+
     private void onAck(Replica.Ack msg) {
         if (!ackCount.containsKey(msg.id))
             return;
@@ -240,11 +257,18 @@ public class Replica extends AbstractReplica {
     private void onUpdate(Replica.Update msg) {
         if (pendingUpdates.containsKey(msg.id)) return;
         pendingUpdates.put(msg.id, msg);
-        if (msg.sourceReplicaId == this.id) pendingClients.put(msg.id, msg.clientRef);
+        if (msg.sourceReplicaId == this.id) {
+            pendingClients.put(msg.id, msg.clientRef);
+            if (updateTimeout != null) { updateTimeout.cancel(); updateTimeout = null; }
+        }
         tell(new Ack(msg.id), getSender());
+        writeOkTimers.put(msg.id, scheduleTimeout(getMaxLatencyPlusTolerance(), new WriteOkTimeout(msg.id)));
+        checkCrash(AbstractReplica.Crash.Type.Update);
     }
 
     private void onWriteOk(Replica.WriteOk msg) {
+        Cancellable t = writeOkTimers.remove(msg.id);
+        if (t != null) t.cancel();
         Update update = pendingUpdates.remove(msg.id);
         if (update == null) return;
         positions[update.index] = update.value;
@@ -255,6 +279,7 @@ public class Replica extends AbstractReplica {
         if (client != null) {
             tell(new AbstractClient.WriteResult(true, update.index, update.value, this.id), client);
         }
+        checkCrash(AbstractReplica.Crash.Type.WriteOK);
     }
 
     private void onWriteFromClient(Replica.WriteFromClient msg) {
@@ -271,6 +296,8 @@ public class Replica extends AbstractReplica {
             }
         } else {
             tell(stamped, replicas.get(coordinatorID));
+            if (updateTimeout != null) updateTimeout.cancel();
+            updateTimeout = scheduleTimeout(getMaxLatencyPlusTolerance(), new UpdateTimeout());
         }
     }
 
@@ -286,6 +313,8 @@ public class Replica extends AbstractReplica {
                 .match(SendHeartbeat.class, this::onSendHeartbeat)
                 .match(Heartbeat.class, this::onHeartbeat)
                 .match(HeartbeatTimeout.class, this::onHeartbeatTimeout)
+                .match(WriteOkTimeout.class, this::onWriteOkTimeout)
+                .match(UpdateTimeout.class, this::onUpdateTimeout)
                 .build();
     }
 
