@@ -22,11 +22,12 @@ public class Main {
         Logger.setDestinationStdout();
         Logger.setDebugEnabled(true);
 
+        final int MIN_LAT = 50, MAX_LAT = 100;
         Map<Integer, ActorRef> replicas = new HashMap<>(N_REPLICAS);
         for (int i = 0; i < N_REPLICAS; i++) {
             replicas.put(i,
                 system.actorOf(
-                    Replica.props(i, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY, AbstractReplica.COORDINATOR_BEAT_INTERVAL),
+                    Replica.props(i, MIN_LAT, MAX_LAT, AbstractReplica.COORDINATOR_BEAT_INTERVAL),
                     "Replica_" + i
                 )
             );
@@ -51,14 +52,24 @@ public class Main {
         }
         
         // TODO: Implement your main logic
+
+        // Phase 1: normal read/write/read via replica 1
         clients.get(1).tell(new AbstractClient.ReadRequest(0), ActorRef.noSender());
         clients.get(1).tell(new AbstractClient.WriteRequest(0, 67), ActorRef.noSender());
         clients.get(1).tell(new AbstractClient.ReadRequest(0), ActorRef.noSender());
-        try {
-            Thread.sleep(3000);
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        }
+        try { Thread.sleep(2000); } catch (InterruptedException e) { throw new RuntimeException(e); }
+
+        // Phase 2: crash the coordinator
+        System.out.println("\n>>> CRASHING COORDINATOR (replica 0) <<<\n");
+        replicas.get(0).tell(new AbstractReplica.Crash(AbstractReplica.Crash.Type.Now, 0), ActorRef.noSender());
+
+        // Phase 3: wait for election to complete (2x heartbeat timeout + ring + buffer)
+        try { Thread.sleep(3500); } catch (InterruptedException e) { throw new RuntimeException(e); }
+
+        // Phase 4: send a write via replica 2 (non-coordinator) — new coordinator must handle it
+        System.out.println("\n>>> SENDING WRITE AFTER ELECTION <<<\n");
+        clients.get(2).tell(new AbstractClient.WriteRequest(0, 99), ActorRef.noSender());
+        try { Thread.sleep(2000); } catch (InterruptedException e) { throw new RuntimeException(e); }
 
 
         system.terminate();

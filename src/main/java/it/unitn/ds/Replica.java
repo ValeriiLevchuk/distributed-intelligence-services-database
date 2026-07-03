@@ -34,6 +34,7 @@ public class Replica extends AbstractReplica {
     private final Map<UpdateId, Cancellable> writeOkTimers = new HashMap<>();
     private Cancellable updateTimeout = null;
     private Cancellable electionAckTimer = null;
+    private WriteFromClient pendingWrite = null;
 
     public Replica(int id) {
         this(id, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY, AbstractReplica.COORDINATOR_BEAT_INTERVAL, Optional.empty());
@@ -266,6 +267,11 @@ public class Replica extends AbstractReplica {
             })
             .match(ElectionAckTimeout.class, this::onElectionAckTimeout)
             .match(Synchronization.class, this::onSynchronization)
+            .match(WriteFromClient.class, msg -> {
+                pendingWrite = msg.sourceReplicaId == -1
+                    ? new WriteFromClient(msg.index, msg.value, msg.clientRef, this.id)
+                    : msg;
+            })
             .matchAny(msg -> {})
             .build();
     }
@@ -343,6 +349,12 @@ public class Replica extends AbstractReplica {
             if (heartbeatTimeout != null) heartbeatTimeout.cancel();
             heartbeatTimeout = scheduleTimeout(getCoordinatorBeatInterval() * 2, new HeartbeatTimeout());
         }
+
+        if (pendingWrite != null) {
+            WriteFromClient w = pendingWrite;
+            pendingWrite = null;
+            onWriteFromClient(w);
+        }
     }
 
     // =================================================================================
@@ -405,6 +417,7 @@ public class Replica extends AbstractReplica {
         if (msg.sourceReplicaId == this.id) {
             pendingClients.put(msg.id, msg.clientRef);
             if (updateTimeout != null) { updateTimeout.cancel(); updateTimeout = null; }
+            pendingWrite = null;
         }
         tell(new Ack(msg.id), getSender());
         writeOkTimers.put(msg.id, scheduleTimeout(getMaxLatencyPlusTolerance(), new WriteOkTimeout(msg.id)));
@@ -440,6 +453,7 @@ public class Replica extends AbstractReplica {
                 tell(update, r);
             }
         } else {
+            pendingWrite = stamped;
             tell(stamped, replicas.get(coordinatorID));
             if (updateTimeout != null) updateTimeout.cancel();
             updateTimeout = scheduleTimeout(getMaxLatencyPlusTolerance(), new UpdateTimeout());
