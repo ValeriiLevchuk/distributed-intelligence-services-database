@@ -267,6 +267,7 @@ public class Replica extends AbstractReplica {
             })
             .match(ElectionAckTimeout.class, this::onElectionAckTimeout)
             .match(Synchronization.class, this::onSynchronization)
+            .match(ReadFromClient.class, this::onReadFromClient)
             .match(WriteFromClient.class, msg -> {
                 pendingWrite = msg.sourceReplicaId == -1
                     ? new WriteFromClient(msg.index, msg.value, msg.clientRef, this.id)
