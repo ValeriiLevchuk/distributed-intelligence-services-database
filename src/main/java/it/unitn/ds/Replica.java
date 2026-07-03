@@ -435,7 +435,7 @@ public class Replica extends AbstractReplica {
             UpdateId uid = new UpdateId(epoch, seqnum++);
             Update update = new Update(uid, stamped.index, stamped.value, stamped.clientRef, stamped.sourceReplicaId);
             pendingUpdates.put(uid, update);
-            ackCount.put(uid, 0);
+            ackCount.put(uid, 1); // coordinator counts its own implicit vote
             for (ActorRef r : replicas.values()) {
                 tell(update, r);
             }
