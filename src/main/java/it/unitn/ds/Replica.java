@@ -450,6 +450,10 @@ public class Replica extends AbstractReplica {
             Update update = new Update(uid, stamped.index, stamped.value, stamped.clientRef, stamped.sourceReplicaId);
             pendingUpdates.put(uid, update);
             ackCount.put(uid, 1); // coordinator counts its own implicit vote
+            // onUpdate will skip this uid (duplicate detection), so save client here directly
+            if (stamped.sourceReplicaId == this.id) {
+                pendingClients.put(uid, stamped.clientRef);
+            }
             for (ActorRef r : replicas.values()) {
                 tell(update, r);
             }
