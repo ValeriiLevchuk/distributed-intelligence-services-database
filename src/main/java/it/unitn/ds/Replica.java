@@ -42,7 +42,6 @@ public class Replica extends AbstractReplica {
 
     public Replica(int id, int minLatency, int maxLatency, int coordinatorBeatInterval, Optional<ActorRef> listener) {
         super(id, minLatency, maxLatency, coordinatorBeatInterval, listener);
-        // TODO: implement
     }
 
     public static Props props(int id, int minLatency, int maxLatency, int coordinatorBeatInterval) {
@@ -56,13 +55,11 @@ public class Replica extends AbstractReplica {
 
     @Override
     public int getSystemNumberOfActors() {
-        // TODO: implement
         return replicas.size();
     }
 
     @Override
     public void crash(AbstractReplica.Crash how_to_crash) {
-        // TODO: implement
         if (how_to_crash.type == AbstractReplica.Crash.Type.Now) {
             getContext().become(createCrashedBehavior());
         } else {
@@ -73,7 +70,6 @@ public class Replica extends AbstractReplica {
 
     @Override
     public void initSystem(InitSystem sysInit) {
-        // TODO: implement
         this.replicas = new HashMap<>(sysInit.group);
         this.coordinatorID = sysInit.coordinator_id;
         if (this.id == coordinatorID) {
@@ -292,6 +288,7 @@ public class Replica extends AbstractReplica {
                 callbackOnCoordinatorElected(this.id);
                 for (ActorRef r : replicas.values()) {
                     tell(new Synchronization(this.id, updateHistory), r);
+                    checkCrash(AbstractReplica.Crash.Type.Election);
                 }
             } else {
                 sendElectionWithAckTimer(msg, nextInRingAfter(this.id));
@@ -306,6 +303,7 @@ public class Replica extends AbstractReplica {
             callbackOnCoordinatorElected(this.id);
             for (ActorRef r : replicas.values()) {
                 tell(new Synchronization(this.id, updateHistory), r);
+                checkCrash(AbstractReplica.Crash.Type.Election);
             }
         } else {
             sendElectionWithAckTimer(msg.election, next);
@@ -327,6 +325,13 @@ public class Replica extends AbstractReplica {
                     lastAppliedId = entry.getKey();
                 callbackOnUpdateApplied(update.index, update.value);
             }
+        }
+
+        // Cancel stale writeOkTimers from old epoch, these won't receive WriteOk
+        // (either the update wasn't committed, or new coordinator will send WriteOk without a timer)
+        for (UpdateId uid : new ArrayList<>(pendingUpdates.keySet())) {
+            Cancellable t = writeOkTimers.remove(uid);
+            if (t != null) t.cancel();
         }
 
         coordinatorID = msg.newCoordinatorId;
@@ -408,6 +413,7 @@ public class Replica extends AbstractReplica {
             ackCount.remove(msg.id);
             for (ActorRef r : replicas.values()) {
                 tell(new WriteOk(msg.id), r);
+                checkCrash(AbstractReplica.Crash.Type.WriteOK);
             }
         }
     }
@@ -456,6 +462,7 @@ public class Replica extends AbstractReplica {
             }
             for (ActorRef r : replicas.values()) {
                 tell(update, r);
+                checkCrash(AbstractReplica.Crash.Type.Update);
             }
         } else {
             pendingWrite = stamped;
@@ -468,7 +475,6 @@ public class Replica extends AbstractReplica {
     @Override
     public final Receive createReceive() {
         return createBaseReceiveBuilder()
-                // TODO add your message handlers here .match(, )
                 .match(Replica.ReadFromClient.class, this::onReadFromClient)
                 .match(Replica.Ack.class, this::onAck)
                 .match(Replica.Update.class, this::onUpdate)
