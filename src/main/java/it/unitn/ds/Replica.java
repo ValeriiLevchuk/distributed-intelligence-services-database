@@ -34,6 +34,7 @@ public class Replica extends AbstractReplica {
     private final Map<UpdateId, Cancellable> writeOkTimers = new HashMap<>();
     private Cancellable updateTimeout = null;
     private Cancellable electionAckTimer = null;
+    private Cancellable electionCompletionTimer = null;
     private WriteFromClient pendingWrite = null;
 
     public Replica(int id) {
@@ -168,6 +169,8 @@ public class Replica extends AbstractReplica {
 
     private static class UpdateTimeout implements Serializable {}
 
+    private static class ElectionCompletionTimeout implements Serializable {}
+
     private static class ElectionAckTimeout implements Serializable {
         final Election election;
         final int targetId;
@@ -249,6 +252,13 @@ public class Replica extends AbstractReplica {
         return best;
     }
 
+    private long getElectionCompletionTimeout() {
+        int n = getSystemNumberOfActors();
+        long detection = (long)(getCoordinatorBeatInterval() * 3.0) + (long) getMaxLatency() * n * 2;
+        long ringHops = (long) n * getMaxLatency() * 2;
+        return (detection + ringHops) * 5;
+    }
+
     private Receive createCrashedBehavior() {
         return receiveBuilder()
             .matchAny(msg -> {})
@@ -262,6 +272,7 @@ public class Replica extends AbstractReplica {
                 if (electionAckTimer != null) { electionAckTimer.cancel(); electionAckTimer = null; }
             })
             .match(ElectionAckTimeout.class, this::onElectionAckTimeout)
+            .match(ElectionCompletionTimeout.class, this::onElectionCompletionTimeout)
             .match(Synchronization.class, this::onSynchronization)
             .match(ReadFromClient.class, this::onReadFromClient)
             .match(WriteFromClient.class, msg -> {
@@ -312,6 +323,7 @@ public class Replica extends AbstractReplica {
 
     private void onSynchronization(Synchronization msg) {
         if (electionAckTimer != null) { electionAckTimer.cancel(); electionAckTimer = null; }
+        if (electionCompletionTimer != null) { electionCompletionTimer.cancel(); electionCompletionTimer = null; }
         // Apply committed updates from winner's history that we're missing
         for (Map.Entry<UpdateId, Update> entry : msg.history.entrySet()) {
             if (!updateHistory.containsKey(entry.getKey())) {
@@ -394,6 +406,18 @@ public class Replica extends AbstractReplica {
         Map<Integer, UpdateId> candidates = new HashMap<>();
         candidates.put(this.id, lastAppliedId);
         sendElectionWithAckTimer(new Election(candidates), nextInRingAfter(this.id));
+        if (electionCompletionTimer != null) electionCompletionTimer.cancel();
+        electionCompletionTimer = scheduleTimeout(getElectionCompletionTimeout(), new ElectionCompletionTimeout());
+    }
+
+    private void onElectionCompletionTimeout(ElectionCompletionTimeout msg) {
+        // Elected winner likely crashed before sending SYNCHRONIZATION; restart election.
+        // Do NOT call callbackOnElectionStarted again — already called when election began.
+        if (electionAckTimer != null) { electionAckTimer.cancel(); electionAckTimer = null; }
+        Map<Integer, UpdateId> candidates = new HashMap<>();
+        candidates.put(this.id, lastAppliedId);
+        sendElectionWithAckTimer(new Election(candidates), nextInRingAfter(this.id));
+        electionCompletionTimer = scheduleTimeout(getElectionCompletionTimeout(), new ElectionCompletionTimeout());
     }
 
     private void onWriteOkTimeout(WriteOkTimeout msg) {
