@@ -180,8 +180,10 @@ public class Replica extends AbstractReplica {
     }
 
     public static class Election implements Serializable {
+        public final int crashedCoordinatorId;
         public final Map<Integer, UpdateId> candidates;
-        public Election(Map<Integer, UpdateId> candidates) {
+        public Election(int crashedCoordinatorId, Map<Integer, UpdateId> candidates) {
+            this.crashedCoordinatorId = crashedCoordinatorId;
             this.candidates = Collections.unmodifiableMap(new HashMap<>(candidates));
         }
     }
@@ -289,7 +291,7 @@ public class Replica extends AbstractReplica {
             // not yet in this election: add self, forward, ACK sender
             Map<Integer, UpdateId> updated = new HashMap<>(msg.candidates);
             updated.put(this.id, lastAppliedId);
-            sendElectionWithAckTimer(new Election(updated), nextInRingAfter(this.id));
+            sendElectionWithAckTimer(new Election(msg.crashedCoordinatorId, updated), nextInRingAfter(this.id));
             tell(new ElectionAck(), getSender());
             checkCrash(AbstractReplica.Crash.Type.Election);
         } else {
@@ -405,9 +407,27 @@ public class Replica extends AbstractReplica {
         getContext().become(createElectionBehavior()); // switch first: freeze lastAppliedId
         Map<Integer, UpdateId> candidates = new HashMap<>();
         candidates.put(this.id, lastAppliedId);
-        sendElectionWithAckTimer(new Election(candidates), nextInRingAfter(this.id));
+        sendElectionWithAckTimer(new Election(coordinatorID, candidates), nextInRingAfter(this.id));
         if (electionCompletionTimer != null) electionCompletionTimer.cancel();
         electionCompletionTimer = scheduleTimeout(getElectionCompletionTimeout(), new ElectionCompletionTimeout());
+    }
+
+    // Entry point for a replica that has NOT independently detected the coordinator's crash yet,
+    // but receives an Election message forwarded by a ring neighbour who has. Without this, the
+    // message would be silently dropped (no handler in the base/normal behavior), breaking ring
+    // propagation and forcing every uninformed replica to fall back to its own, much slower,
+    // independent heartbeat timeout.
+    private void joinElection(Election msg) {
+        if (msg.crashedCoordinatorId != coordinatorID) {
+            // Stale wave: we already know of a newer coordinator (learned via a Synchronization
+            // from a different, concurrently-run election wave for the same crash). ACK so the
+            // sender doesn't falsely treat us as crashed, but don't rejoin/re-fire the callback.
+            tell(new ElectionAck(), getSender());
+            return;
+        }
+        callbackOnElectionStarted(coordinatorID);
+        getContext().become(createElectionBehavior()); // switch first: freeze lastAppliedId
+        onElection(msg);
     }
 
     private void onElectionCompletionTimeout(ElectionCompletionTimeout msg) {
@@ -416,7 +436,7 @@ public class Replica extends AbstractReplica {
         if (electionAckTimer != null) { electionAckTimer.cancel(); electionAckTimer = null; }
         Map<Integer, UpdateId> candidates = new HashMap<>();
         candidates.put(this.id, lastAppliedId);
-        sendElectionWithAckTimer(new Election(candidates), nextInRingAfter(this.id));
+        sendElectionWithAckTimer(new Election(coordinatorID, candidates), nextInRingAfter(this.id));
         electionCompletionTimer = scheduleTimeout(getElectionCompletionTimeout(), new ElectionCompletionTimeout());
     }
 
@@ -509,6 +529,8 @@ public class Replica extends AbstractReplica {
                 .match(HeartbeatTimeout.class, this::onHeartbeatTimeout)
                 .match(WriteOkTimeout.class, this::onWriteOkTimeout)
                 .match(UpdateTimeout.class, this::onUpdateTimeout)
+                .match(Election.class, this::joinElection)
+                .match(Synchronization.class, this::onSynchronization)
                 .build();
     }
 
