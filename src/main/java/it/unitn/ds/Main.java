@@ -4,6 +4,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Scanner;
+import java.util.function.BiConsumer;
 
 import akka.actor.ActorRef;
 import akka.actor.ActorSystem;
@@ -11,10 +12,12 @@ import it.unitn.ds.AbstractReplica.InitSystem;
 
 public class Main {
 
-    static final int  MIN_LAT       = 50;
-    static final int  MAX_LAT       = 100;
-    static final long READ_TIMEOUT  = 1_000;
-    static final long WRITE_TIMEOUT = 12_000;
+    static final int  MIN_LAT        = 50;
+    static final int  MAX_LAT        = 100;
+    static final long READ_TIMEOUT   = 1_000;
+    static final long WRITE_TIMEOUT  = 12_000;
+    static final long WRITE_WAIT = 1_500;
+    static final long READ_WAIT =   500;
 
     public static void main(String[] args) {
         Logger.setDestinationStdout();
@@ -33,7 +36,7 @@ public class Main {
             "",
             "4. Write Buffered During Election",
             "   Write arrives at non-coordinator during election; buffered",
-            "   in pendingWrite and resubmitted after SYNCHRONIZATION.",
+            "   in pendingWrites and resubmitted after SYNCHRONIZATION.",
             "",
             "5. Non-Coordinator Crash -- Quorum Tolerance",
             "   Minority of replicas crash; writes still succeed;",
@@ -75,34 +78,28 @@ public class Main {
              "         Reads from any replica must reflect the committed value.",
              "Expect : WriteResult(true) for every write; ReadResult values",
              "         consistent across all replicas after each write.");
+        runScenario("Scenario1", 5, 0, (R, C) -> {
+            step("1. Client_1 reads index=0 (initial value = 0)");
+            read(C, 1, 0);  sleep(1_200);
 
-        ActorSystem sys = ActorSystem.create("Scenario1");
-        Map<Integer, ActorRef> R = replicas(sys, 5, 0);
-        Map<Integer, ActorRef> C = clients(sys, R, 5);
+            step("2. Client_1 writes index=0 = 42  (replica 1 forwards to coordinator 0)");
+            write(C, 1, 0, 42);  sleep(WRITE_WAIT);
 
-        step("1. Client_1 reads index=0 (initial value = 0)");
-        read(C, 1, 0);  sleep(1_200);
+            step("3. Client_1 reads index=0 -- expect 42");
+            read(C, 1, 0);  sleep(READ_WAIT);
 
-        step("2. Client_1 writes index=0 = 42  (replica 1 forwards to coordinator 0)");
-        write(C, 1, 0, 42);  sleep(1_500);
+            step("4. Client_3 reads index=0 from replica 3 -- same value (sequential consistency)");
+            read(C, 3, 0);  sleep(READ_WAIT);
 
-        step("3. Client_1 reads index=0 -- expect 42");
-        read(C, 1, 0);  sleep(500);
+            step("5. Client_2 writes index=1 = 99  (second distinct position)");
+            write(C, 2, 1, 99);  sleep(WRITE_WAIT);
 
-        step("4. Client_3 reads index=0 from replica 3 -- same value (sequential consistency)");
-        read(C, 3, 0);  sleep(500);
+            step("6. Client_4 reads index=1 from replica 4 -- expect 99");
+            read(C, 4, 1);  sleep(READ_WAIT);
 
-        step("5. Client_2 writes index=1 = 99  (second distinct position)");
-        write(C, 2, 1, 99);  sleep(1_500);
-
-        step("6. Client_4 reads index=1 from replica 4 -- expect 99");
-        read(C, 4, 1);  sleep(500);
-
-        step("7. Client_0 reads index=0 from coordinator (replica 0) -- still 42");
-        read(C, 0, 0);  sleep(500);
-
-        sys.terminate();
-        footer();
+            step("7. Client_0 reads index=0 from coordinator (replica 0) -- still 42");
+            read(C, 0, 0);  sleep(READ_WAIT);
+        });
     }
 
     // =========================================================================
@@ -118,34 +115,28 @@ public class Main {
              "         everyone up to date, then resumes normal write processing.",
              "Expect : [Replica X] ELECTION STARTED; [Replica Y] NEW COORDINATOR",
              "         elected: Y; subsequent write and reads succeed.");
+        runScenario("Scenario2", 5, 0, (R, C) -> {
+            step("1. Client_1 writes index=0 = 10  (establish state before crash)");
+            write(C, 1, 0, 10);  sleep(WRITE_WAIT);
 
-        ActorSystem sys = ActorSystem.create("Scenario2");
-        Map<Integer, ActorRef> R = replicas(sys, 5, 0);
-        Map<Integer, ActorRef> C = clients(sys, R, 5);
+            step("2. Client_2 reads index=0 -- expect 10");
+            read(C, 2, 0);  sleep(READ_WAIT);
 
-        step("1. Client_1 writes index=0 = 10  (establish state before crash)");
-        write(C, 1, 0, 10);  sleep(1_500);
+            step("3. >>> CRASHING coordinator (replica 0) NOW <<<");
+            note("Replicas detect via heartbeat timeout (~2 s).",
+                 "Ring election follows (~1 s for 5 nodes).",
+                 "Winner = replica with highest lastAppliedId (tie: highest ID).");
+            crash(R, 0);  sleep(6_000); // detection + ring + SYNC propagation
 
-        step("2. Client_2 reads index=0 -- expect 10");
-        read(C, 2, 0);  sleep(500);
+            step("4. Client_2 writes index=0 = 55  (to new coordinator after election)");
+            write(C, 2, 0, 55);  sleep(WRITE_WAIT);
 
-        step("3. >>> CRASHING coordinator (replica 0) NOW <<<");
-        note("Replicas detect via heartbeat timeout (~2 s).",
-             "Ring election follows (~1 s for 5 nodes).",
-             "Winner = replica with highest lastAppliedId (tie: highest ID).");
-        crash(R, 0);  sleep(6_000); // detection + ring + SYNC propagation
+            step("5. Client_3 reads index=0 from replica 3 -- expect 55");
+            read(C, 3, 0);  sleep(READ_WAIT);
 
-        step("4. Client_2 writes index=0 = 55  (to new coordinator after election)");
-        write(C, 2, 0, 55);  sleep(1_500);
-
-        step("5. Client_3 reads index=0 from replica 3 -- expect 55");
-        read(C, 3, 0);  sleep(500);
-
-        step("6. Client_4 reads index=0 from replica 4 -- expect 55  (all replicas consistent)");
-        read(C, 4, 0);  sleep(500);
-
-        sys.terminate();
-        footer();
+            step("6. Client_4 reads index=0 from replica 4 -- expect 55  (all replicas consistent)");
+            read(C, 4, 0);  sleep(READ_WAIT);
+        });
     }
 
     // =========================================================================
@@ -163,33 +154,27 @@ public class Main {
              "         Agreement (no update acknowledged by a quorum is ever lost).",
              "Expect : Election starts; new coordinator elected; all replicas",
              "         eventually apply index=0 = 77.");
+        runScenario("Scenario3", 5, 0, (R, C) -> {
+            step("1. Arm coordinator (replica 0): crash after first Update-phase checkCrash");
+            note("Crash.Type = Update, after_n = 1",
+                 "Coordinator will send UPDATE to ALL replicas (the current",
+                 "message handler completes), then become unresponsive.",
+                 "Replicas receive UPDATE, send ACK -- but coordinator ignores",
+                 "all ACKs. WriteOk is never sent by old coordinator.");
+            arm(R, 0, AbstractReplica.Crash.Type.Update, 1);
 
-        ActorSystem sys = ActorSystem.create("Scenario3");
-        Map<Integer, ActorRef> R = replicas(sys, 5, 0);
-        Map<Integer, ActorRef> C = clients(sys, R, 5);
+            step("2. Client_1 writes index=0 = 77  via replica 1");
+            note("Coordinator broadcasts UPDATE to all, then crashes.",
+                 "writeOkTimers on all replicas fire (~350 ms) -> election.",
+                 "New coordinator finds uid in pendingUpdates, sends WriteOk.");
+            write(C, 1, 0, 77);  sleep(5_000); // writeOkTimer + election + new-coordinator WriteOk
 
-        step("1. Arm coordinator (replica 0): crash after first Update-phase checkCrash");
-        note("Crash.Type = Update, after_n = 1",
-             "Coordinator will send UPDATE to ALL replicas (the current",
-             "message handler completes), then become unresponsive.",
-             "Replicas receive UPDATE, send ACK -- but coordinator ignores",
-             "all ACKs. WriteOk is never sent by old coordinator.");
-        arm(R, 0, AbstractReplica.Crash.Type.Update, 1);
-
-        step("2. Client_1 writes index=0 = 77  via replica 1");
-        note("Coordinator broadcasts UPDATE to all, then crashes.",
-             "writeOkTimers on all replicas fire (~350 ms) -> election.",
-             "New coordinator finds uid in pendingUpdates, sends WriteOk.");
-        write(C, 1, 0, 77);  sleep(5_000); // writeOkTimer + election + new-coordinator WriteOk
-
-        step("3. Reads from replicas 2, 3, 4 -- all should return 77");
-        note("Uniform Agreement: every surviving replica applied the update.");
-        read(C, 2, 0);  sleep(400);
-        read(C, 3, 0);  sleep(400);
-        read(C, 4, 0);  sleep(400);
-
-        sys.terminate();
-        footer();
+            step("3. Reads from replicas 2, 3, 4 -- all should return 77");
+            note("Uniform Agreement: every surviving replica applied the update.");
+            read(C, 2, 0);  sleep(READ_WAIT);
+            read(C, 3, 0);  sleep(READ_WAIT);
+            read(C, 4, 0);  sleep(READ_WAIT);
+        });
     }
 
     // =========================================================================
@@ -202,35 +187,29 @@ public class Main {
              "         a non-coordinator replica.",
              "         The replica forwards the write to (now-crashed) coordinator 0",
              "         and starts an updateTimeout. When it fires, the replica enters",
-             "         election mode and saves the write in pendingWrite.",
+             "         election mode and saves the write in pendingWrites.",
              "         After SYNCHRONIZATION completes, it resubmits automatically.",
              "Expect : WriteResult(true, 0, 88) arrives for Client_2 only after the",
              "         election finishes; reads from all replicas then return 88.");
+        runScenario("Scenario4", 5, 0, (R, C) -> {
+            step("1. Client_1 writes index=0 = 5  (establish baseline state)");
+            write(C, 1, 0, 5);  sleep(WRITE_WAIT);
 
-        ActorSystem sys = ActorSystem.create("Scenario4");
-        Map<Integer, ActorRef> R = replicas(sys, 5, 0);
-        Map<Integer, ActorRef> C = clients(sys, R, 5);
+            step("2. >>> CRASHING coordinator (replica 0) NOW <<<");
+            crash(R, 0);  sleep(150); // let crash take effect before write is forwarded
 
-        step("1. Client_1 writes index=0 = 5  (establish baseline state)");
-        write(C, 1, 0, 5);  sleep(1_500);
+            step("3. Client_2 writes index=0 = 88  (immediately after crash -- will be buffered)");
+            note("Replica 2 forwards write to coordinator 0, starts updateTimeout.",
+                 "updateTimeout fires (~350 ms) -> election starts.",
+                 "Write is stored in pendingWrites; resubmitted after SYNC.");
+            write(C, 2, 0, 88);  sleep(7_000); // updateTimeout + election + resubmit + write round-trip
 
-        step("2. >>> CRASHING coordinator (replica 0) NOW <<<");
-        crash(R, 0);  sleep(150); // let crash take effect before write is forwarded
+            step("4. Client_3 reads index=0 from replica 3 -- expect 88");
+            read(C, 3, 0);  sleep(READ_WAIT);
 
-        step("3. Client_2 writes index=0 = 88  (immediately after crash -- will be buffered)");
-        note("Replica 2 forwards write to coordinator 0, starts updateTimeout.",
-             "updateTimeout fires (~350 ms) -> election starts.",
-             "Write is stored in pendingWrite; resubmitted after SYNC.");
-        write(C, 2, 0, 88);  sleep(7_000); // updateTimeout + election + resubmit + write round-trip
-
-        step("4. Client_3 reads index=0 from replica 3 -- expect 88");
-        read(C, 3, 0);  sleep(500);
-
-        step("5. Client_4 reads index=0 from replica 4 -- expect 88");
-        read(C, 4, 0);  sleep(500);
-
-        sys.terminate();
-        footer();
+            step("5. Client_4 reads index=0 from replica 4 -- expect 88");
+            read(C, 4, 0);  sleep(READ_WAIT);
+        });
     }
 
     // =========================================================================
@@ -246,33 +225,41 @@ public class Main {
              "         A client bound to a crashed replica gets a READ timeout.",
              "Expect : Writes succeed; reads return correct value on replicas 0-3;",
              "         Client_4 READ times out after " + READ_TIMEOUT + " ms.");
+        runScenario("Scenario5", 7, 0, (R, C) -> {
+            step("1. Client_1 writes index=0 = 20  (all 7 replicas alive)");
+            write(C, 1, 0, 20);  sleep(WRITE_WAIT);
 
-        ActorSystem sys = ActorSystem.create("Scenario5");
-        Map<Integer, ActorRef> R = replicas(sys, 7, 0);
-        Map<Integer, ActorRef> C = clients(sys, R, 7);
+            step("2. >>> CRASHING replicas 4, 5, 6  (3 out of 7 -- minority) <<<");
+            note("Quorum = 4. Survivors: 0,1,2,3. Coordinator (0) is alive.",
+                 "No election triggered -- coordinator is still reachable.");
+            crashAll(R, 4, 5, 6);  sleep(READ_WAIT);
 
-        step("1. Client_1 writes index=0 = 20  (all 7 replicas alive)");
-        write(C, 1, 0, 20);  sleep(1_500);
+            step("3. Client_2 writes index=0 = 99  (quorum of 4 alive -> succeeds)");
+            write(C, 2, 0, 99);  sleep(WRITE_WAIT);
 
-        step("2. >>> CRASHING replicas 4, 5, 6  (3 out of 7 -- minority) <<<");
-        note("Quorum = 4. Survivors: 0,1,2,3. Coordinator (0) is alive.",
-             "No election triggered -- coordinator is still reachable.");
-        crash(R, 4);  crash(R, 5);  crash(R, 6);  sleep(500);
+            step("4. Client_1 reads index=0 from replica 1 -- expect 99");
+            read(C, 1, 0);  sleep(READ_WAIT);
 
-        step("3. Client_2 writes index=0 = 99  (quorum of 4 alive -> succeeds)");
-        write(C, 2, 0, 99);  sleep(1_500);
+            step("5. Client_3 reads index=0 from replica 3 -- expect 99");
+            read(C, 3, 0);  sleep(READ_WAIT);
 
-        step("4. Client_1 reads index=0 from replica 1 -- expect 99");
-        read(C, 1, 0);  sleep(500);
+            step("6. Client_4 reads from crashed replica 4 -- READ TIMEOUT expected");
+            note("Replica 4 is in crashed mode (ignores all messages).",
+                 "Client read timeout = " + READ_TIMEOUT + " ms.");
+            read(C, 4, 0);  sleep(1_800); // comfortably past the 1000 ms read timeout
+        });
+    }
 
-        step("5. Client_3 reads index=0 from replica 3 -- expect 99");
-        read(C, 3, 0);  sleep(500);
+    // =========================================================================
+    // Helpers -- scenario lifecycle
+    // =========================================================================
 
-        step("6. Client_4 reads from crashed replica 4 -- READ TIMEOUT expected");
-        note("Replica 4 is in crashed mode (ignores all messages).",
-             "Client read timeout = " + READ_TIMEOUT + " ms.");
-        read(C, 4, 0);  sleep(1_800); // comfortably past the 1000 ms read timeout
-
+    private static void runScenario(String sysName, int n, int coordId,
+                                    BiConsumer<Map<Integer, ActorRef>, Map<Integer, ActorRef>> body) {
+        ActorSystem sys = ActorSystem.create(sysName);
+        Map<Integer, ActorRef> R = replicas(sys, n, coordId);
+        Map<Integer, ActorRef> C = clients(sys, R, n);
+        body.accept(R, C);
         sys.terminate();
         footer();
     }
@@ -317,6 +304,10 @@ public class Main {
     private static void crash(Map<Integer, ActorRef> R, int id) {
         R.get(id).tell(new AbstractReplica.Crash(AbstractReplica.Crash.Type.Now, 0),
                        ActorRef.noSender());
+    }
+
+    private static void crashAll(Map<Integer, ActorRef> R, int... ids) {
+        for (int id : ids) crash(R, id);
     }
 
     private static void arm(Map<Integer, ActorRef> R, int id,
