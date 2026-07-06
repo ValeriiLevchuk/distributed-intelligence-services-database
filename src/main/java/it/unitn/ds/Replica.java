@@ -84,16 +84,10 @@ public class Replica extends AbstractReplica {
     // API Messages
     // =================================================================================
 
-    public static class ReadFromClient {
-        ActorRef replica;
-        int index;
+    public static class ReadFromClient implements Serializable {
+        public final int index;
 
         public ReadFromClient(int index) {
-            this(index, null);
-        }
-
-        public ReadFromClient(int index, ActorRef replica) {
-            this.replica = replica;
             this.index = index;
         }
     }
@@ -261,6 +255,17 @@ public class Replica extends AbstractReplica {
         return (detection + ringHops) * 5;
     }
 
+    private void broadcastSynchronization() {
+        for (ActorRef r : replicas.values()) {
+            tell(new Synchronization(this.id, updateHistory), r);
+            checkCrash(AbstractReplica.Crash.Type.Election);
+        }
+    }
+
+    private void updateLastApplied(UpdateId id) {
+        if (lastAppliedId == null || id.compareTo(lastAppliedId) > 0) lastAppliedId = id;
+    }
+
     private Receive createCrashedBehavior() {
         return receiveBuilder()
             .matchAny(msg -> {})
@@ -301,10 +306,7 @@ public class Replica extends AbstractReplica {
                 // callbackOnCoordinatorElected fires once, uniformly for every replica
                 // (winner included), inside onSynchronization below -- the winner also
                 // receives its own broadcast copy, since it addresses replicas.values().
-                for (ActorRef r : replicas.values()) {
-                    tell(new Synchronization(this.id, updateHistory), r);
-                    checkCrash(AbstractReplica.Crash.Type.Election);
-                }
+                broadcastSynchronization();
             } else {
                 sendElectionWithAckTimer(msg, nextInRingAfter(this.id));
             }
@@ -316,10 +318,7 @@ public class Replica extends AbstractReplica {
         if (next == this.id) {
             // went all the way around with no response: sole survivor
             // (callback fires uniformly in onSynchronization, see onElection above)
-            for (ActorRef r : replicas.values()) {
-                tell(new Synchronization(this.id, updateHistory), r);
-                checkCrash(AbstractReplica.Crash.Type.Election);
-            }
+            broadcastSynchronization();
         } else {
             sendElectionWithAckTimer(msg.election, next);
         }
@@ -337,8 +336,7 @@ public class Replica extends AbstractReplica {
                 if (t != null) t.cancel();
                 positions[update.index] = update.value;
                 updateHistory.put(entry.getKey(), update);
-                if (lastAppliedId == null || entry.getKey().compareTo(lastAppliedId) > 0)
-                    lastAppliedId = entry.getKey();
+                updateLastApplied(entry.getKey());
                 callbackOnUpdateApplied(update.index, update.value);
             }
         }
@@ -453,9 +451,9 @@ public class Replica extends AbstractReplica {
     }
 
     private void onAck(Replica.Ack msg) {
-        if (!ackCount.containsKey(msg.id))
-            return;
-        int count = ackCount.get(msg.id) + 1;
+        Integer count = ackCount.get(msg.id);
+        if (count == null) return;
+        count++;
         ackCount.put(msg.id, count);
         if (count >= replicas.size() / 2 + 1) {
             ackCount.remove(msg.id);
@@ -491,7 +489,7 @@ public class Replica extends AbstractReplica {
         if (update == null) return;
         positions[update.index] = update.value;
         updateHistory.put(msg.id, update);
-        if (lastAppliedId == null || msg.id.compareTo(lastAppliedId) > 0) lastAppliedId = msg.id;
+        updateLastApplied(msg.id);
         callbackOnUpdateApplied(update.index, update.value);
         ActorRef client = pendingClients.remove(msg.id);
         if (client != null) {
