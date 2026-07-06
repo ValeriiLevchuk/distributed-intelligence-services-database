@@ -3,19 +3,18 @@
 ![Akka](https://img.shields.io/badge/Akka-15A9CE?style=flat-square&logo=akka&logoColor=white)
 ![Gradle](https://img.shields.io/badge/Gradle-Build-02303A?style=flat-square&logo=gradle&logoColor=white)
 
-Repository for the **Distributed Systems** project assigned in the academic year **2025–2026**.  
-The project is implemented in **Java** using **Akka Actors**.
-
-## Setting up Gradle
-
-To avoid version issues, you are required to use Gradle `9.2.1`.  
-The easiest way to achieve this is by using a wrapper:
+## Build and Run
 
 ```bash
+# One-time setup (if Gradle wrapper is not present)
 gradle wrapper --gradle-version 9.2.1
+
+./gradlew build        # compile
+./gradlew run          # interactive demo (5 scenarios)
+./gradlew test         # run all 33 tests
 ```
 
-If you have an old version of Gradle, you can update it running
+If Gradle is not installed:
 
 ```bash
 curl -s "https://get.sdkman.io" | bash
@@ -23,103 +22,80 @@ source "$HOME/.sdkman/bin/sdkman-init.sh"
 sdk install gradle 9.2.1
 ```
 
-## Build, Run, and Tets the Project
+---
 
-```bash
-./gradlew build
-./gradlew run
-./gradlew test
-```
+## Demo Scenarios
 
-## Repository Structure
+`./gradlew run` opens an interactive menu. Choose 1–5:
 
-In the `main/java/it/unitn/ds` directory you will find the project base classes.  
-`AbstractClient` and `AbstractReplica` contain the logic and structure that allows automated tests to work.  
-Your implementation **must** use as base classes `Client` and `Replica` (which already inherit from their corresponding abstract classes).
+| # | Title | What it demonstrates |
+|---|-------|----------------------|
+| 1 | Normal Operation | Two-phase broadcast end-to-end; sequential consistency across any replica |
+| 2 | Coordinator Crash and Recovery | Heartbeat timeout → ring election → new coordinator resumes writes |
+| 3 | Uniform Agreement | Coordinator crashes after UPDATE phase; new coordinator completes the write |
+| 4 | Write Buffered During Election | Non-coordinator buffers write during election, resubmits after SYNC |
+| 5 | Quorum Tolerance | Minority crash (3 of 7); writes still succeed; crashed-replica read times out |
 
-### Logs
+Demo configuration (`Main.java`): `MIN_LAT = 50 ms`, `MAX_LAT = 100 ms`, `READ_TIMEOUT = 1 s`, `WRITE_TIMEOUT = 12 s`.
 
-Please, **DO NOT print directly to standard output or file**. Instead, use the provided `Logger` class. Use the `log(String)` function to print "official" logs. Use `debug(String)` for debug prints. Both `AbstractClient` and `AbstractReplica` provide `log` and `debug` wrappers that prepend to your logs the string `[Client/Replica <ID>]` (resp.).
+---
 
-*Not adhering to this may cause automated tests to fail, even if your code works perfectly. This is due to prints slowing down you code. Tests are based on strict time intervals.*
+## Tests
 
-## Client
+> A small number of tests are sensitive to JVM scheduling jitter (Akka HashedWheelTimer granularity × 6 protocol hops). They pass consistently on the second/third run on loaded machines.
 
-As enforced by the abstract class, your `Client` class **must** implement the following methods:
-- `public void sendRead(ActorRef replica, int index)`
-- `public void sendWrite(ActorRef replica, int index, int value)`
+---
 
-During tests, these methods will be automatically invoked by the abstract class.  
-In you test main function, if you want a client to send a message, do the following:
-```java
-int index = 0;
-client.tell(new AbstractClient.ReadRequest(index), Actor.noSender());
-```
+## How It Works
 
-For complete examples, please refer to `test/java/it/unitn/ds/base/APICompliance.java`.
+### Normal Operation — Two-Phase Broadcast
 
-To ensure automated tests can detect events in you system you **must** invoke the `AbstractClient.callback*(...)` methods whenever required, depending on the semantic of the callback.  
-Follows a complete list of client-side callbacks. You can find more info in the related Java docs in the code.
+Write path (6 hops end-to-end):
 
-- `callbackOnReadResult(AbstractClient.ReadResult)`
-- `callbackOnWriteResult(AbstractClient.WriteResult)`
-- `callbackOnReadTimeout(AbstractClient.ReadTimeout)`
-- `callbackOnWriteTimeout(AbstractClient.WriteTimeout)`
+1. Client sends `WriteFromClient` to its bound replica.
+2. Non-coordinator replica forwards it to the coordinator and arms an `updateTimeout`.
+3. Coordinator assigns `UpdateId(epoch, seqnum)` and broadcasts `Update` to all replicas.
+4. Each replica stores the update in `pendingUpdates`, sends `Ack`, and arms a `writeOkTimer`.
+5. Coordinator collects ACKs; once a quorum **Q = ⌊N/2⌋+1** is reached (counting its own implicit vote), broadcasts `WriteOk` to all.
+6. Each replica applies the update to `positions[]`, moves it to `updateHistory`, and fires `callbackOnUpdateApplied`.
 
-## Replica
+Read path: replica reads directly from its local `positions[]` and replies immediately — no coordination needed.
 
-Analogously to `Client` your `Replica` implementation **must** implement some methods and invoke callbacks.
+### Coordinator Election
 
-*Methods*
+**Detection:** non-coordinators reset a heartbeat timer on every `Heartbeat`. If the timer fires (2× the coordinator beat interval), they start an election.
 
-- `public int getSystemNumberOfActors()`
-- `public void crash(AbstractReplica.Crash how)`
-- `public void initSystem(AbstractReplica.InitSystem sysInit)`
+**Ring algorithm:**
+1. Initiating replica enters election mode (freezing its `lastAppliedId`), sends `Election{candidates}` to its ring successor.
+2. Each node on the ring adds itself (with its `lastAppliedId`) and forwards.
+3. When the message completes a full loop, the initiator selects the best candidate: highest `lastAppliedId`, tie-break: highest replica ID.
+4. Winner broadcasts `Synchronization{updateHistory}` to all replicas.
+5. Each replica applies any missing committed updates, increments the epoch, fires `callbackOnCoordinatorElected`, and resumes normal operation.
 
-*Callbacks*
+**Robustness mechanisms:**
+- `ElectionAck` timeout — if the ring successor does not ACK within `getMaxLatencyPlusTolerance()`, the election message is forwarded to the next node (skipping the silent one).
+- `ElectionCompletionTimeout` — if the elected winner crashes before broadcasting `Synchronization`, the election restarts automatically.
+- Stale election waves — a replica that has already learned of a newer coordinator (via a concurrent election) ACKs without rejoining.
 
-- `callbackOnUpdateApplied(int index, int value)`
-- `callbackOnElectionStarted(int crashedCoordId)`
-- `callbackOnCoordinatorElected(int newCoordID)`
+### Uniform Agreement
 
-As for the client, you can find more documentation in the Java docs.
+If the coordinator broadcasts `Update` to all replicas but crashes before collecting ACKs or sending `WriteOk`:
 
-The size of positions list **must** be equal to `AbstractReplica.POSITIONS_LIST_LENGTH`.
+1. Every replica's `writeOkTimer` fires after `getMaxLatencyPlusTolerance()`.
+2. An election starts and a new coordinator is elected.
+3. The new coordinator finds the uncommitted update in its `pendingUpdates` and immediately broadcasts `WriteOk` for it before starting the new epoch.
 
-Coordinators **must** send heartbeats every `AbstractReplica.getCoordinatorBeatInterval()` milliseconds.
+This guarantees that no update received by all replicas is ever silently discarded.
 
-### Emulated Network Delays
+### Write Buffering During Election
 
-Automated tests expect to see particular messages after calculated time intervals. These intervals are computed based on `AbstractReplica.getMinLatency()` and `AbstractReplica.getMaxLatency()` (these latencies will be set by the `AbstractReplica` class constructor). It is therefore fundamental that your replica implementation conforms to these delays. Delays are always expressed in MILLISECONDS.
+If a `WriteFromClient` arrives at a non-coordinator while an election is in progress:
+- The write is stored in `pendingWrites`.
+- Once `Synchronization` arrives and normal mode resumes, all buffered writes are automatically resubmitted to the new coordinator.
 
-`AbstractReplica` provides a `void tell(Serializable m, ActorRef dst)` method which emulates network latency ensuring messages are delivered in FIFO order (`NetworkChannel` class). **Not using this method may cause some tests to fail (even if the implementation is correct).** 
+---
 
-*Hint: in your replica implementation, create the `tell`, `broadcast`, and `multicast` functions to handle messages. This way, you will unify the handling of crashes.*
+## Authors
 
-## How do tests work?
-
-In the `test/java/it/unitn/ds/base` directory you can find some basic tests that allow to verify basic system functionalities. First of all, refer to `APICompliance.java`.
-
-In general, each test works as follows:
-1) Initialize a new system using the `AbstractReplica.InitSystem` message.
-2) Whenever an actor (`Client` or `Replica`) is instantiated, the test passes to it a `probe` (or `listener`), which is a special kind of actor (`akka.testkit.javadsl.TestKit`). This is achieved via the `Client/Replica.propsWithListener(...)` method.
-3) The test will send read/write requests and emulate crashes using the abstract methods and pre-defined message classes of clients and replicas.
-4) The `callback*(...)` functions will forward messages to the `probe` which will then be able to verify that the system behaves as intended.
-
-In summary:
-1) Abstract classes ensure test have a standardized way to send read and write requests from clients and emulate crashes.
-2) Properly invoked callbacks ensure that probes receive the required information to verify the system's behavior.
-
-Thus, **it is crucial that you follow `Client` and `Replica` guidelines** (described above).
-
-**Before you submit you project, all base tests must pass.**  
-*Submissions that do not meet this requirement will be ignored.*
-
-## Note
-
-This is the first time we automate the tests. If you find issues in the base classes or base tests, let us know via email or telegram group.
-
-## Contributors
-
-- Stefano Genetti [stefano.genetti@unitn.it]
-- Thomas Pasquali [thomas.pasquali@unitn.it]
+- Valerii Levchuk — [valerii.levchuk@studenti.unitn.it]
+- Yehor Sharevych — [yehor.sharevych@studenti.unitn.it]
