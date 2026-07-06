@@ -35,7 +35,7 @@ public class Replica extends AbstractReplica {
     private Cancellable updateTimeout = null;
     private Cancellable electionAckTimer = null;
     private Cancellable electionCompletionTimer = null;
-    private WriteFromClient pendingWrite = null;
+    private final List<WriteFromClient> pendingWrites = new ArrayList<>();
 
     public Replica(int id) {
         this(id, AbstractReplica.MIN_LATENCY, AbstractReplica.MAX_LATENCY, AbstractReplica.COORDINATOR_BEAT_INTERVAL, Optional.empty());
@@ -278,9 +278,9 @@ public class Replica extends AbstractReplica {
             .match(Synchronization.class, this::onSynchronization)
             .match(ReadFromClient.class, this::onReadFromClient)
             .match(WriteFromClient.class, msg -> {
-                pendingWrite = msg.sourceReplicaId == -1
+                pendingWrites.add(msg.sourceReplicaId == -1
                     ? new WriteFromClient(msg.index, msg.value, msg.clientRef, this.id)
-                    : msg;
+                    : msg);
             })
             .matchAny(msg -> {})
             .build();
@@ -298,7 +298,9 @@ public class Replica extends AbstractReplica {
             // message came back around: determine winner
             int winner = bestCandidate(msg.candidates);
             if (winner == this.id) {
-                callbackOnCoordinatorElected(this.id);
+                // callbackOnCoordinatorElected fires once, uniformly for every replica
+                // (winner included), inside onSynchronization below -- the winner also
+                // receives its own broadcast copy, since it addresses replicas.values().
                 for (ActorRef r : replicas.values()) {
                     tell(new Synchronization(this.id, updateHistory), r);
                     checkCrash(AbstractReplica.Crash.Type.Election);
@@ -313,7 +315,7 @@ public class Replica extends AbstractReplica {
         int next = nextInRingAfter(msg.targetId);
         if (next == this.id) {
             // went all the way around with no response: sole survivor
-            callbackOnCoordinatorElected(this.id);
+            // (callback fires uniformly in onSynchronization, see onElection above)
             for (ActorRef r : replicas.values()) {
                 tell(new Synchronization(this.id, updateHistory), r);
                 checkCrash(AbstractReplica.Crash.Type.Election);
@@ -370,10 +372,12 @@ public class Replica extends AbstractReplica {
             heartbeatTimeout = scheduleTimeout(getCoordinatorBeatInterval() * 2, new HeartbeatTimeout());
         }
 
-        if (pendingWrite != null) {
-            WriteFromClient w = pendingWrite;
-            pendingWrite = null;
-            onWriteFromClient(w);
+        if (!pendingWrites.isEmpty()) {
+            List<WriteFromClient> toResubmit = new ArrayList<>(pendingWrites);
+            pendingWrites.clear();
+            for (WriteFromClient w : toResubmit) {
+                onWriteFromClient(w);
+            }
         }
     }
 
@@ -467,8 +471,13 @@ public class Replica extends AbstractReplica {
         pendingUpdates.put(msg.id, msg);
         if (msg.sourceReplicaId == this.id) {
             pendingClients.put(msg.id, msg.clientRef);
+            pendingWrites.removeIf(w -> w.clientRef.equals(msg.clientRef));
             if (updateTimeout != null) { updateTimeout.cancel(); updateTimeout = null; }
-            pendingWrite = null;
+            if (!pendingWrites.isEmpty()) {
+                // Other forwarded writes are still awaiting their echo; the coordinator just
+                // proved it's alive, so give them a fresh window instead of a stale one.
+                updateTimeout = scheduleTimeout(getMaxLatencyPlusTolerance(), new UpdateTimeout());
+            }
         }
         tell(new Ack(msg.id), getSender());
         writeOkTimers.put(msg.id, scheduleTimeout(getMaxLatencyPlusTolerance(), new WriteOkTimeout(msg.id)));
@@ -509,10 +518,13 @@ public class Replica extends AbstractReplica {
                 checkCrash(AbstractReplica.Crash.Type.Update);
             }
         } else {
-            pendingWrite = stamped;
+            pendingWrites.add(stamped);
             tell(stamped, replicas.get(coordinatorID));
-            if (updateTimeout != null) updateTimeout.cancel();
-            updateTimeout = scheduleTimeout(getMaxLatencyPlusTolerance(), new UpdateTimeout());
+            // Don't reset an already-running timeout: a write already in flight keeps its
+            // own deadline, and this one rides along on it rather than clobbering the timer.
+            if (updateTimeout == null) {
+                updateTimeout = scheduleTimeout(getMaxLatencyPlusTolerance(), new UpdateTimeout());
+            }
         }
     }
 
